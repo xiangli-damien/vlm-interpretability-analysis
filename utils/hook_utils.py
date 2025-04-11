@@ -59,258 +59,269 @@ class HookManager(Protocol):
         ...
 
 
-# --- Activation Cache Implementation ---
-# Implicitly implements HookManager if all methods are defined
-class ActivationCache:
+# --- Activation Cache (Forward Only) ---
+class ActivationCache(HookManager):
     """
-    Captures activations (hidden states) and optionally attention weights
-    using forward hooks. Does NOT require gradients.
-    Implements the HookManager interface implicitly.
+    Captures activations and optionally attention weights using forward hooks.
+    Provides a clean way to register hooks and store results.
+    Implements the HookManager protocol.
     """
-    def __init__(self, cpu_offload: bool = True, capture_activations: bool = True, capture_attentions: bool = False):
-        """
-        Initializes the ActivationCache.
+    def __init__(self):
+        self.activations: Dict[str, torch.Tensor] = {}  # Stores hidden states from layers
+        self.attentions: Dict[str, torch.Tensor] = {}   # Stores attention weights
+        self._hooks: List[torch.utils.hooks.RemovableHandle] = []  # Tracks registered hooks
 
-        Args:
-            cpu_offload (bool): Move captured tensors to CPU and detach. Defaults to True.
-            capture_activations (bool): Whether to capture hidden states/activations. Defaults to True.
-            capture_attentions (bool): Whether to capture attention weights. Defaults to False.
-        """
-        self.activations: Dict[str, torch.Tensor] = {}
-        self.attentions: Dict[str, torch.Tensor] = {}
-        self._hooks: List[torch.utils.hooks.RemovableHandle] = []
-        self.cpu_offload = cpu_offload
-        self.capture_activations = capture_activations
-        self.capture_attentions = capture_attentions
-        self._layers_hooked: Set[str] = set()
-        print(f"Initialized ActivationCache (Capture Activations: {self.capture_activations}, Capture Attentions: {self.capture_attentions}, CPU Offload: {self.cpu_offload})")
+    def _hook_fn(self, layer_name: str, capture_attention: bool = False):
+        """Creates a hook function that captures layer outputs."""
+        def hook(module, input, output):
+            # Capture hidden states
+            activation_tensor = None
+            if isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], torch.Tensor):
+                activation_tensor = output[0]
+            elif isinstance(output, torch.Tensor):
+                activation_tensor = output
 
-    def _create_hook_fn(self, layer_name: str) -> Callable:
-        """Factory function to create the specific forward hook callback for a layer."""
-        def hook(module: nn.Module, input_args: Tuple[Any, ...], output: Any):
-            # --- Capture Activations (Hidden State) ---
-            if self.capture_activations:
-                hidden_state: Optional[torch.Tensor] = None
-                # Try to extract the primary tensor output (often the hidden state)
-                if isinstance(output, torch.Tensor):
-                    hidden_state = output
-                # Handle cases where output is a tuple (e.g., (hidden_state, ...))
-                elif isinstance(output, tuple) and len(output) > 0 and isinstance(output[0], torch.Tensor):
-                    hidden_state = output[0]
-                # Add more checks here if models have different output structures
+            if activation_tensor is not None:
+                self.activations[layer_name] = activation_tensor.detach()
 
-                if hidden_state is not None:
-                    # Process the captured hidden state
-                    processed_hs = hidden_state.detach() # Detach from computation graph
-                    if self.cpu_offload:
-                        processed_hs = processed_hs.cpu() # Move to CPU if requested
-                    self.activations[layer_name] = processed_hs
-                # else: # Reduce verbosity for missing states
-                #     print(f"ActivationCache Warn: No hidden state tensor found for layer '{layer_name}' output type {type(output)}.")
-
-            # --- Capture Attention Weights ---
-            if self.capture_attentions:
-                attn_weights: Optional[torch.Tensor] = None
-                # Common patterns for attention weights in Hugging Face model outputs:
-                # (hidden_state, attn_weights, ...)
-                # (hidden_state, present_key_value, attn_weights, ...)
+            # Optionally capture attention weights
+            if capture_attention:
+                attn_weights = None
+                # Common patterns for attention weights in Hugging Face models
                 if isinstance(output, tuple):
-                    # Check second element if it looks like attention weights (typically 4D: B, H, S, S)
-                    if len(output) > 1 and isinstance(output[1], torch.Tensor) and output[1].ndim == 4:
-                        attn_weights = output[1]
-                    # Check third element if second element might be KV cache
-                    elif len(output) > 2 and isinstance(output[2], torch.Tensor) and output[2].ndim == 4:
-                        attn_weights = output[2]
-                    # Add more checks for different model families if needed
+                    # Pattern 1: (hidden_state, present_key_value, attention_weights)
+                    if len(output) > 2 and isinstance(output[2], torch.Tensor) and output[2].ndim >= 4:
+                       # Basic check: Often [batch, heads, seq, seq]
+                       if output[2].shape[-1] == output[2].shape[-2]:
+                           attn_weights = output[2]
+                    # Pattern 2: (hidden_state, attention_weights, present_key_value)
+                    elif len(output) > 1 and isinstance(output[1], torch.Tensor) and output[1].ndim >= 4:
+                         if output[1].shape[-1] == output[1].shape[-2]:
+                             attn_weights = output[1]
+                    # Pattern 3: (hidden_state, maybe_pooled_output, attentions) - Less common direct output
+                    # Add more patterns specific to the models you use if needed
 
                 if attn_weights is not None:
-                    # Process the captured attention weights
-                    processed_attn = attn_weights.detach() # Detach from graph
-                    if self.cpu_offload:
-                        processed_attn = processed_attn.cpu() # Move to CPU if requested
-                    self.attentions[layer_name] = processed_attn
-                # else: # Reduce verbosity for missing attention
-                #     print(f"ActivationCache Warn: No attention weights tensor found for layer '{layer_name}' output type {type(output)}.")
+                    self.attentions[layer_name] = attn_weights.detach()
         return hook
 
-    # --- HookManager Interface Methods ---
+    def register_hooks(self, model: torch.nn.Module, layer_names: List[str], attention_layer_names: List[str] = None) -> None:
+        """
+        Registers forward hooks on specified layers.
 
-    def register_hooks(self, model: nn.Module, layer_names: List[str]):
-        """Registers forward hooks on the specified layers."""
-        self.clear() # Clear previous hooks and cache before registering new ones
-        self._layers_hooked = set(layer_names)
-        # print(f"ActivationCache: Registering forward hooks for {len(layer_names)} layers...")
+        Args:
+            model (torch.nn.Module): The model to hook into.
+            layer_names (List[str]): List of layer names to capture hidden states from.
+            attention_layer_names (List[str], optional): List of layer names to also capture attention from. Defaults to None.
+        """
+        self.clear() # Clear previous hooks and data
+        _attention_layers = set(attention_layer_names or [])
+        all_layers_to_hook = set(layer_names) | _attention_layers
 
-        hook_count = 0
-        not_found_count = 0
-        for name in layer_names:
-            module = get_module_by_name(model, name)
-            if module:
-                # Create and register the hook for this specific module
-                hook_fn = self._create_hook_fn(name)
-                handle = module.register_forward_hook(hook_fn)
-                self._hooks.append(handle) # Store the handle to remove later
-                hook_count += 1
-            else:
-                print(f"Warning (ActivationCache): Module '{name}' not found in model.")
-                not_found_count += 1
-
-        # print(f"ActivationCache: Registered {hook_count} hooks.")
-        if not_found_count > 0:
-            print(f"Warning (ActivationCache): Could not find {not_found_count} out of {len(layer_names)} requested modules.")
-        return self # Allow chaining
+        for name, module in model.named_modules():
+            if name in all_layers_to_hook:
+                capture_attn = name in _attention_layers
+                handle = module.register_forward_hook(self._hook_fn(name, capture_attention=capture_attn))
+                self._hooks.append(handle)
+        print(f"ActivationCache: Registered {len(self._hooks)} forward hooks.")
 
     def get_captured_data(self) -> Dict[str, Any]:
-        """Returns captured activations and/or attentions based on initialization config."""
-        data = {}
-        if self.capture_activations:
-            data["activations"] = self.activations
-        if self.capture_attentions:
-            data["attentions"] = self.attentions
-        # NOTE: We do *not* clear the cache here automatically.
-        # The calling function (e.g., engine's stepwise loop) should call clear_cache()
-        # when appropriate for the analysis step.
+        """Returns captured activations and attentions, then clears storage."""
+        data = {"activations": self.activations.copy(), "attentions": self.attentions.copy()}
+        self.activations.clear()
+        self.attentions.clear()
         return data
+
+    def clear_hooks(self) -> None:
+        """Removes all registered hooks."""
+        # print(f"ActivationCache: Removing {len(self._hooks)} hooks.")
+        for handle in self._hooks:
+            handle.remove()
+        self._hooks = []
+
+    def clear(self) -> None:
+        """Clears captured data and removes hooks."""
+        self.clear_hooks()
+        self.activations = {}
+        self.attentions = {}
+        # print("ActivationCache: Cleared data and hooks.")
 
     def requires_gradient(self) -> bool:
         """ActivationCache does not require gradients."""
         return False
 
-    def clear_hooks(self):
-        """Removes all registered forward hooks."""
-        if not self._hooks: return # Nothing to remove
-        # print(f"ActivationCache: Removing {len(self._hooks)} hooks...")
-        for handle in self._hooks:
-            handle.remove() # Use the handle to remove the hook
-        self._hooks = [] # Clear the list of handles
-        self._layers_hooked = set() # Clear the set of hooked layers
-
-    def clear_cache(self):
-        """Clears stored activation and attention data from internal dictionaries."""
-        # print("ActivationCache: Clearing cached data...")
-        self.activations = {}
-        self.attentions = {}
-        # Optionally trigger garbage collection, but might be overkill here
-        # gc.collect()
-
-    def clear(self):
-        """Clears both hooks and cached data. Recommended before reuse."""
-        self.clear_hooks()
-        self.clear_cache()
-
-    # --- Context Manager Methods (Optional but convenient) ---
-    # Allows using 'with ActivationCache(...) as cache:' syntax
-    def __enter__(self):
-        """Enter context manager."""
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Exit context manager: automatically removes hooks."""
-        self.clear_hooks()
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_value, traceback): self.clear()
 
 
-# --- Gradient Attention Capture Implementation ---
-class GradientAttentionCapture:
+# --- Gradient Attention Capture (Forward + Backward) ---
+class GradientAttentionCapture(HookManager):
     """
-    This class captures the gradients flowing through attention modules using forward
-    and full backward hooks. It stores both the attention weights and their gradients,
-    and it can be configured to offload gradients to CPU.
-    
-    Modification:
-    In the forward hook, if the attention weights do not have grad enabled, we force them
-    to require gradients (by calling `requires_grad_()`). This ensures that when we call
-    backward(), the gradients are computed so that the hook can capture them.
+    Captures gradients flowing through attention modules for saliency analysis.
+    Implements the HookManager protocol.
+    Uses forward hooks to store attention weights and backward hooks to capture gradients.
     """
     def __init__(self, cpu_offload_grads: bool = False):
-        self.attention_weights = {}  # Mapping: layer name -> attention weight tensor
-        self.attention_grads = {}    # Mapping: layer name -> gradient tensor (captured)
-        self.forward_hooks = []      # Store forward hook handles
-        self.backward_hooks = []     # Store backward hook handles
+        """
+        Initializes the gradient capturer.
+
+        Args:
+            cpu_offload_grads (bool): If True, move captured gradients to CPU immediately
+                                      after capture to save GPU memory. Defaults to False.
+        """
+        self.attention_weights: Dict[str, torch.Tensor] = {} # Stores attention weights from forward pass
+        self.attention_grads: Dict[str, torch.Tensor] = {}   # Stores gradients w.r.t attention weights
+        self._forward_hooks: List[torch.utils.hooks.RemovableHandle] = []
+        self._backward_hooks: List[torch.utils.hooks.RemovableHandle] = []
+        self._tensor_grad_hooks: List[torch.utils.hooks.RemovableHandle] = [] # Track tensor-specific grad hooks
         self.cpu_offload_grads = cpu_offload_grads
+        print(f"Initialized GradientAttentionCapture (Offload Grads: {self.cpu_offload_grads})")
 
     def _forward_hook_fn(self, layer_name: str):
-        """
-        Creates and returns a forward hook function that attempts to extract the attention weights.
-        If the tensor does not have gradients enabled, it forces it (via requires_grad_()).
-        """
+        """Creates a forward hook to STORE the attention weights tensor."""
         def hook(module, input, output):
-            # Try to extract the attention weights from typical output positions.
             attn_weights = None
+            # Common patterns for attention weights in Hugging Face models
             if isinstance(output, tuple):
-                # Some models return attention as the second element (e.g., output[1])
-                if len(output) >= 2 and isinstance(output[1], torch.Tensor):
-                    attn_weights = output[1]
-                # Alternatively, check the third element.
-                elif len(output) >= 3 and isinstance(output[2], torch.Tensor):
-                    attn_weights = output[2]
-            elif isinstance(output, torch.Tensor):
-                attn_weights = output
+                # Pattern 1: (hidden_state, present_key_value, attention_weights)
+                if len(output) > 2 and isinstance(output[2], torch.Tensor) and output[2].ndim >= 4:
+                   if output[2].shape[-1] == output[2].shape[-2]: attn_weights = output[2]
+                # Pattern 2: (hidden_state, attention_weights, present_key_value)
+                elif len(output) > 1 and isinstance(output[1], torch.Tensor) and output[1].ndim >= 4:
+                     if output[1].shape[-1] == output[1].shape[-2]: attn_weights = output[1]
 
-            if attn_weights is not None:
-                # IMPORTANT: Ensure that the attention weights require gradients
-                if not attn_weights.requires_grad:
-                    # Force the tensor to require gradients so that backward() can compute them.
-                    attn_weights.requires_grad_()
-                    # Optionally, call retain_grad() so that even if the tensor is not a leaf it will be retained.
-                    attn_weights.retain_grad()
-                # Store a detached copy of the attention weights (for reference)
-                self.attention_weights[layer_name] = attn_weights.detach()
+            # Add other checks if needed (e.g., for different model output structures)
+
+            # Store the tensor IF found AND it requires grad (needed for backward)
+            if attn_weights is not None and attn_weights.requires_grad:
+                # Store the *original* tensor, do not detach here!
+                self.attention_weights[layer_name] = attn_weights
+                # print(f"DEBUG Forward Hook {layer_name}: Stored attn weights {attn_weights.shape}") # DEBUG
+            # elif attn_weights is not None:
+            #     print(f"DEBUG Forward Hook {layer_name}: Found attn weights {attn_weights.shape} but requires_grad=False") # DEBUG
+            # else:
+            #     print(f"DEBUG Forward Hook {layer_name}: Could not find suitable attn weights in output.") # DEBUG
+
         return hook
 
     def _backward_hook_fn(self, layer_name: str):
-        """
-        Creates and returns a backward hook function that, when the gradient is computed,
-        captures it and stores it in the attention_grads dictionary.
-        """
+        """Creates a backward hook (for the *module*) that registers a *tensor* hook."""
         def hook(module, grad_input, grad_output):
-            if layer_name not in self.attention_weights:
-                return
-            attn_weights = self.attention_weights[layer_name]
-            def _capture_grad(grad):
-                grad_detached = grad.detach()
-                if self.cpu_offload_grads:
-                    grad_detached = grad_detached.cpu()
-                self.attention_grads[layer_name] = grad_detached
-            # Register a hook on the attention weights so that when they are backpropagated,
-            # the gradient is captured.
-            attn_weights.register_hook(_capture_grad)
+            # Check if we stored attention weights for this layer in the forward pass
+            if layer_name in self.attention_weights:
+                attn_weights_tensor = self.attention_weights[layer_name]
+
+                # Define the function that captures the gradient for the *tensor*
+                def _capture_grad(grad):
+                    if grad is not None:
+                        # print(f"DEBUG Tensor Grad Hook {layer_name}: Captured grad {grad.shape}") # DEBUG
+                        # Detach and optionally move to CPU
+                        processed_grad = grad.detach()
+                        if self.cpu_offload_grads:
+                            processed_grad = processed_grad.cpu()
+                        self.attention_grads[layer_name] = processed_grad
+                    # else:
+                        # print(f"DEBUG Tensor Grad Hook {layer_name}: Received None gradient.") # DEBUG
+
+                # CRITICAL: Register the capture function directly on the stored attention tensor
+                # This hook will execute when the gradient for *this specific tensor* is computed
+                if attn_weights_tensor.requires_grad:
+                   handle = attn_weights_tensor.register_hook(_capture_grad)
+                   self._tensor_grad_hooks.append(handle) # Track this tensor hook
+                # else:
+                #    print(f"DEBUG Backward Hook {layer_name}: attn_weights tensor does not require grad, cannot register tensor hook.") # DEBUG
+
+            # else:
+            #     print(f"DEBUG Backward Hook {layer_name}: No attn weights stored, skipping tensor hook registration.") # DEBUG
+
         return hook
 
-    def register_hooks(self, model: torch.nn.Module, layer_names: list):
-        """
-        Registers forward and backward hooks on the modules whose names match those in layer_names.
-        """
-        self.clear_hooks()
-        for name, module in model.named_modules():
-            if name in layer_names:
-                f_hook = module.register_forward_hook(self._forward_hook_fn(name))
-                # Use register_full_backward_hook() so that gradients from non-leaf nodes are captured.
-                b_hook = module.register_full_backward_hook(self._backward_hook_fn(name))
-                self.forward_hooks.append(f_hook)
-                self.backward_hooks.append(b_hook)
-        return self
+    def register_hooks(self, model: torch.nn.Module, layer_names: List[str]) -> None:
+        """Registers forward and backward hooks on specified layers."""
+        self.clear() # Ensure clean state before registering new hooks
+        if not layer_names:
+            print("GradientAttentionCapture: No layer names provided to register hooks.")
+            return
 
-    def get_captured_data(self) -> dict:
-        """
-        Returns a dictionary containing the captured attention weights and gradients.
-        It then clears the internal stored hooks and data.
-        """
+        for layer_name in layer_names:
+            module = None
+            try:
+                # Helper to get module by name (assumed to exist in model_utils)
+                from utils.model_utils import get_module_by_name
+                module = get_module_by_name(model, layer_name)
+            except ImportError:
+                 print("Warning: Cannot import get_module_by_name from utils.model_utils")
+                 # Basic fallback (might not work for nested modules)
+                 try: module = dict(model.named_modules())[layer_name]
+                 except KeyError: module = None
+            except Exception as e:
+                 print(f"Error getting module '{layer_name}': {e}")
+                 module = None
+
+            if module is not None:
+                # Register forward hook to store attention weights
+                f_handle = module.register_forward_hook(self._forward_hook_fn(layer_name))
+                self._forward_hooks.append(f_handle)
+                # Register backward hook to attach gradient hook to the tensor
+                b_handle = module.register_full_backward_hook(self._backward_hook_fn(layer_name))
+                self._backward_hooks.append(b_handle)
+            else:
+                print(f"Warning: Module '{layer_name}' not found in model. Cannot register hooks.")
+        print(f"GradientAttentionCapture: Registered {len(self._forward_hooks)} forward and {len(self._backward_hooks)} backward hooks.")
+
+
+    def get_captured_data(self) -> Dict[str, Any]:
+        """Returns captured attention weights and gradients, then clears internal storage."""
+        # Return copies to prevent external modification
         data = {
             "attention_weights": self.attention_weights.copy(),
             "attention_grads": self.attention_grads.copy()
         }
-        self.clear_hooks()
+        # print(f"DEBUG get_captured_data: Returning {len(data['attention_weights'])} weights, {len(data['attention_grads'])} grads.") # DEBUG
+        # Clear internal storage after retrieval
         self.attention_weights.clear()
         self.attention_grads.clear()
+        # Also clear tensor grad hooks as they are tied to the specific backward pass
+        self._clear_tensor_grad_hooks()
         return data
 
-    def clear_hooks(self):
-        """
-        Removes all registered forward and backward hooks.
-        """
-        for hook in self.forward_hooks:
-            hook.remove()
-        for hook in self.backward_hooks:
-            hook.remove()
-        self.forward_hooks = []
-        self.backward_hooks = []
+    def _clear_tensor_grad_hooks(self) -> None:
+        """Removes only the tensor-specific gradient hooks."""
+        # print(f"GradientAttentionCapture: Removing {len(self._tensor_grad_hooks)} tensor grad hooks.") # DEBUG
+        for handle in self._tensor_grad_hooks:
+            handle.remove()
+        self._tensor_grad_hooks = []
+
+
+    def clear_hooks(self) -> None:
+        """Removes all registered forward, backward, and tensor hooks."""
+        # print(f"GradientAttentionCapture: Removing {len(self._forward_hooks)} forward hooks.") # DEBUG
+        for handle in self._forward_hooks: handle.remove()
+        self._forward_hooks = []
+
+        # print(f"GradientAttentionCapture: Removing {len(self._backward_hooks)} backward hooks.") # DEBUG
+        for handle in self._backward_hooks: handle.remove()
+        self._backward_hooks = []
+
+        # Ensure tensor hooks are also cleared
+        self._clear_tensor_grad_hooks()
+
+    def clear(self) -> None:
+        """Clears captured data and removes all hooks."""
+        self.clear_hooks()
+        self.attention_weights = {}
+        self.attention_grads = {}
+        gc.collect() # Add garbage collection on full clear
+        # print("GradientAttentionCapture: Cleared data and all hooks.")
+
+
+    def requires_gradient(self) -> bool:
+        """GradientAttentionCapture requires gradients."""
+        return True
+
+    def __del__(self):
+        """Ensure hooks are removed when the object is deleted."""
+        self.clear_hooks()
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_value, traceback): self.clear()

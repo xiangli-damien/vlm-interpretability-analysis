@@ -151,75 +151,51 @@ def compute_flow_metrics_optimized(
     return metrics
 
 
+# --- calculate_saliency_scores (Modified Logging) ---
 def calculate_saliency_scores(
     attention_weights: Dict[str, torch.Tensor],
     attention_grads: Dict[str, torch.Tensor]
 ) -> Dict[str, torch.Tensor]:
     """
     Calculate attention saliency scores using the GRAD * ATTENTION method.
-
     Saliency Score S = |A * (dA/dL)|
-    where A is the attention weight matrix and dA/dL is the gradient of the loss
-    with respect to the attention weights.
-
-    Args:
-        attention_weights (Dict[str, torch.Tensor]): Dictionary mapping layer names
-            to attention weight tensors (e.g., shape [Batch, Heads, SeqLen, SeqLen]).
-            These weights should ideally require gradients if grads were computed based on them.
-        attention_grads (Dict[str, torch.Tensor]): Dictionary mapping layer names
-            to gradient tensors of the loss w.r.t. attention weights. Must have the
-            same shape and device as the corresponding weights. Gradients are typically
-            detached outputs from a `backward()` call.
-
-    Returns:
-        Dict[str, torch.Tensor]: Dictionary mapping layer names to the computed
-            saliency score tensors. Saliency tensors have the same shape as the
-            input attention weights and are detached from the computation graph.
+    (Docstring remains the same)
     """
     saliency_scores: Dict[str, torch.Tensor] = {}
-    print(f"Calculating saliency scores for {len(attention_grads)} layers with gradients...")
+    # *** MODIFIED LOGGING ***
+    num_layers_with_grads = len(attention_grads)
+    if num_layers_with_grads == 0:
+         print("Calculating saliency scores: No gradients provided. Returning empty.")
+         return {}
+    print(f"Calculating saliency scores for {num_layers_with_grads} layer(s) with gradients...")
+    # **********************
 
-    # Iterate through layers that have gradients available
-    layers_with_grads = list(attention_grads.keys()) # Use list copy for safe iteration if needed
+    layers_with_grads = list(attention_grads.keys())
 
+    calculated_count = 0
     for layer_name in layers_with_grads:
-        # Check if corresponding attention weights are also available
         if layer_name in attention_weights:
             attn = attention_weights[layer_name]
             grad = attention_grads[layer_name]
 
-            # --- Sanity Checks ---
-            # Verify that shapes match
             if attn.shape != grad.shape:
-                print(f"  Saliency Calc Warning: Shape mismatch for layer '{layer_name}'! Weights: {attn.shape}, Grad: {grad.shape}. Skipping.")
+                print(f"  Saliency Calc Warning: Shape mismatch layer '{layer_name}'! W:{attn.shape}, G:{grad.shape}. Skip.")
                 continue
-            # Verify that devices match, attempt to move gradient if necessary
             if attn.device != grad.device:
-                print(f"  Saliency Calc Warning: Device mismatch for layer '{layer_name}'! Weights: {attn.device}, Grad: {grad.device}. Attempting to move grad.")
-                try:
-                    grad = grad.to(attn.device)
-                except Exception as e:
-                    print(f"    Saliency Calc Error: Failed to move gradient for layer '{layer_name}': {e}. Skipping layer.")
-                    continue
-            # Optional check: Warn if weights didn't require grad (though grads exist)
-            # if not attn.requires_grad:
-            #     print(f"  Saliency Calc Warning: Attention weights for layer '{layer_name}' do not require grad, yet gradients exist.")
+                print(f"  Saliency Calc Warning: Device mismatch layer '{layer_name}'! W:{attn.device}, G:{grad.device}. Moving grad.")
+                try: grad = grad.to(attn.device)
+                except Exception as e: print(f"  Error moving grad: {e}. Skip."); continue
 
-            # --- Compute Saliency ---
             try:
-                # Calculate S = |A * grad(A)|
-                # Use float32 for the multiplication for potentially better precision, then take absolute value
                 saliency = torch.abs(attn.float() * grad.float())
-                # Store the detached saliency score tensor
                 saliency_scores[layer_name] = saliency.detach()
+                calculated_count += 1
             except Exception as e:
-                print(f"  Saliency Calc Error: Failed computing saliency for layer '{layer_name}': {e}. Skipping.")
-
+                print(f"  Saliency Calc Error: Failed for layer '{layer_name}': {e}. Skip.")
         else:
-            # Warn if gradients exist but weights are missing
-            print(f"  Saliency Calc Warning: Gradient found for layer '{layer_name}', but no corresponding attention weights were provided. Cannot compute saliency.")
+             print(f"  Saliency Calc Warning: Grad found for '{layer_name}', but no weights. Skip.")
 
-    print(f"Calculated saliency scores for {len(saliency_scores)} layers.")
+    print(f"Calculated saliency scores for {calculated_count} layers.")
     return saliency_scores
 
 
