@@ -264,124 +264,146 @@ class LLaVANextEngine:
              return Image.new('RGB', (1,1)) # Return dummy on error
 
 
-    def create_feature_mapping(self, input_ids: torch.Tensor, image_size_orig_hw: Tuple[int, int]) -> Dict[str, Any]:
+    def create_feature_mapping(
+        self,
+        input_ids: torch.Tensor,
+        # Renamed argument for clarity: reflects the size passed TO the processor
+        image_size_processed_hw: Tuple[int, int]
+        ) -> Dict[str, Any]:
         """
-        Create mapping from token indices to spatial grid positions using external image utils.
+        Create mapping from token indices to spatial grid positions.
 
-        Handles LLaVA-Next's base (fixed grid) and spatial patch features. Relies on engine's
-        stored config values and calls imported image processing functions.
+        Handles LLaVA-Next's base (fixed grid) and spatial patch features based
+        on the actual generated input_ids and the dimensions of the image that
+        was processed.
 
         Args:
-            input_ids (torch.Tensor): The processed input_ids tensor [1, seq_len].
-            image_size_orig_hw (Tuple[int, int]): Original image size (Height, Width).
+            input_ids (torch.Tensor): The processed input_ids tensor [1, seq_len]
+                                      output by the processor.
+            image_size_processed_hw (Tuple[int, int]): Dimensions (Height, Width)
+                of the image that was passed into the processor in build_inputs.
+                This might be the original size or a pre-resized size.
 
         Returns:
-            Dict[str, Any]: Dictionary with mapping information.
+            Dict[str, Any]: Dictionary with mapping information, including calculated
+                            dimensions based on the processed image size.
         """
         image_token_id = self.config.get("image_token_id")
+        # (Input validation remains the same)
         if image_token_id is None: raise ValueError("Missing 'image_token_id' in engine config.")
         image_spans = get_image_token_spans(input_ids, image_token_id)
-
         if not image_spans:
             print("Engine: No image spans found, cannot create feature mapping.")
-            return {}
+            return {"error": "No image spans found in input_ids"}
 
-        # --- Get necessary config values ---
+        # (Get config values remains the same)
         base_grid_size = self.config.get("vision_patch_grid_size", 24)
         raw_patch_size = self.config.get("vision_raw_patch_size", 14)
         image_grid_pinpoints = self.config.get("image_grid_pinpoints")
-
         if not image_grid_pinpoints: raise ValueError("Missing 'image_grid_pinpoints' in engine config.")
         if raw_patch_size <= 0: raise ValueError("Invalid 'vision_raw_patch_size' in engine config.")
 
-        # --- Base Feature Mapping ---
-        span_start = image_spans[0][0]
-        span_end = image_spans[-1][1]
+        # (Base Feature Mapping logic remains the same)
+        span_start = image_spans[0][0]; span_end = image_spans[-1][1]
         expected_base_tokens = base_grid_size * base_grid_size
         actual_base_token_count = min(expected_base_tokens, span_end - span_start + 1)
-        base_start_idx = span_start
-        base_end_idx = span_start + actual_base_token_count - 1
+        base_start_idx = span_start; base_end_idx = span_start + actual_base_token_count - 1
         mapping_base = {base_start_idx + i: (i // base_grid_size, i % base_grid_size) for i in range(actual_base_token_count)}
 
-        # --- Spatial (Patch) Feature Mapping ---
+        # (Spatial Feature Mapping initialization remains the same)
         spatial_start_idx_potential = base_end_idx + 1
         num_spatial_tokens_available = max(0, span_end - spatial_start_idx_potential + 1)
-
-        # Initialize spatial mapping variables
-        mapping_spatial = {}
-        mapping_newline = {}
+        mapping_spatial, mapping_newline = {}, {}
         unpadded_grid_rows, unpadded_grid_cols = 0, 0
         grid_rows_padded, grid_cols_padded = 0, 0
-        target_resolution_wh = (0, 0)
-        resized_dimensions_wh = (0, 0)
-        padded_dimensions_wh = (0, 0)
-        actual_spatial_start_idx = -1
-        actual_spatial_end_idx = -1
+        target_resolution_wh_calc, resized_dimensions_wh_calc, padded_dimensions_wh_calc = (0, 0), (0, 0), (0, 0)
+        actual_spatial_start_idx, actual_spatial_end_idx = -1, -1
 
+        # (Spatial Feature Mapping calculation logic remains the same, using image_size_processed_hw)
         if num_spatial_tokens_available > 0:
-            # --- Use imported calculate_resized_dimensions ---
-            if not callable(calculate_resized_dimensions):
-                 print("Error: calculate_resized_dimensions utility not available. Cannot map spatial features.")
+            if not callable(calculate_resized_dimensions) or not callable(select_best_resolution):
+                 print("Error: Dimension calculation utilities not available. Cannot map spatial features.")
             else:
-                orig_height, orig_width = image_size_orig_hw
-                target_resolution_hw = select_best_resolution(image_size_orig_hw, image_grid_pinpoints)
-                target_height, target_width = target_resolution_hw
-                target_resolution_wh = (target_width, target_height)
+                try:
+                    # Use the size of the image *passed to the processor* here
+                    proc_img_h, proc_img_w = image_size_processed_hw
+                    # Select best resolution based on the image size processor received
+                    target_resolution_hw = select_best_resolution(image_size_processed_hw, image_grid_pinpoints)
+                    target_height, target_width = target_resolution_hw
+                    target_resolution_wh_calc = (target_width, target_height) # Store calculated W, H
 
-                # Use the imported utility function
-                resized_width, resized_height = calculate_resized_dimensions(image_size_orig_hw, target_resolution_hw)
-                resized_dimensions_wh = (resized_width, resized_height)
+                    # Calculate expected resize/pad dimensions based on this target
+                    resized_width, resized_height = calculate_resized_dimensions(image_size_processed_hw, target_resolution_hw)
+                    resized_dimensions_wh_calc = (resized_width, resized_height) # Store calculated W, H
 
-                # Padding calculations (remain similar logic, but use calculated sizes)
-                padded_height = math.ceil(resized_height / raw_patch_size) * raw_patch_size
-                padded_width = math.ceil(resized_width / raw_patch_size) * raw_patch_size
-                padded_dimensions_wh = (padded_width, padded_height)
+                    padded_height = math.ceil(resized_height / raw_patch_size) * raw_patch_size
+                    padded_width = math.ceil(resized_width / raw_patch_size) * raw_patch_size
+                    padded_dimensions_wh_calc = (padded_width, padded_height) # Store calculated W, H
 
-                grid_rows_padded = padded_height // raw_patch_size
-                grid_cols_padded = padded_width // raw_patch_size
+                    grid_rows_padded = padded_height // raw_patch_size
+                    grid_cols_padded = padded_width // raw_patch_size
+                    unpadded_grid_rows = math.ceil(resized_height / raw_patch_size)
+                    unpadded_grid_cols = math.ceil(resized_width / raw_patch_size)
+                    has_newline = unpadded_grid_rows > 1
 
-                unpadded_grid_rows = math.ceil(resized_height / raw_patch_size)
-                unpadded_grid_cols = math.ceil(resized_width / raw_patch_size)
-                num_unpadded_patches = unpadded_grid_rows * unpadded_grid_cols
+                    # (Token mapping loop remains the same)
+                    current_token_idx = spatial_start_idx_potential
+                    processed_spatial_count = 0
+                    for r in range(unpadded_grid_rows):
+                        for c in range(unpadded_grid_cols):
+                            if current_token_idx <= span_end:
+                                if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
+                                mapping_spatial[current_token_idx] = (r, c)
+                                actual_spatial_end_idx = current_token_idx
+                                current_token_idx += 1; processed_spatial_count += 1
+                            else: break
+                        if current_token_idx > span_end: break
+                        if has_newline and r < (unpadded_grid_rows - 1):
+                            if current_token_idx <= span_end:
+                                if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
+                                mapping_newline[current_token_idx] = r
+                                actual_spatial_end_idx = current_token_idx
+                                current_token_idx += 1; processed_spatial_count += 1
+                            else: break
+                except Exception as map_err:
+                     print(f"Warning: Error during spatial feature mapping calculation: {map_err}")
 
-                has_newline = unpadded_grid_rows > 1
-                # expected_spatial_tokens_structure = num_unpadded_patches + (unpadded_grid_rows - 1 if has_newline else 0) # Not strictly needed for mapping loop
-
-                # Perform mapping based on expected structure and available tokens
-                current_token_idx = spatial_start_idx_potential
-                processed_spatial_count = 0
-                for r in range(unpadded_grid_rows):
-                    for c in range(unpadded_grid_cols):
-                        if current_token_idx <= span_end:
-                            if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
-                            mapping_spatial[current_token_idx] = (r, c)
-                            actual_spatial_end_idx = current_token_idx
-                            current_token_idx += 1; processed_spatial_count += 1
-                        else: break
-                    if current_token_idx > span_end: break
-                    # Handle newline token insertion logic
-                    if has_newline and r < (unpadded_grid_rows - 1):
-                        if current_token_idx <= span_end:
-                            # If this is the first token being processed, it might be the start
-                            if processed_spatial_count == 0: actual_spatial_start_idx = current_token_idx
-                            mapping_newline[current_token_idx] = r # Store row index before newline
-                            actual_spatial_end_idx = current_token_idx # Update end index
-                            current_token_idx += 1; processed_spatial_count += 1
-                        else: break
-
-        # Assemble results
+        # --- Assemble results (MODIFIED KEYS FOR CLARITY) ---
         return {
-            "base_feature": {"start_idx": base_start_idx, "end_idx": base_end_idx, "grid": (base_grid_size, base_grid_size), "positions": mapping_base},
-            "patch_feature": {"start_idx": actual_spatial_start_idx, "end_idx": max(mapping_spatial.keys()) if mapping_spatial else -1, "grid_for_visualization": (grid_rows_padded, grid_cols_padded), "grid_unpadded": (unpadded_grid_rows, unpadded_grid_cols), "positions": mapping_spatial},
-            "newline_feature": {"start_idx": min(mapping_newline.keys()) if mapping_newline else -1, "end_idx": max(mapping_newline.keys()) if mapping_newline else -1, "positions": mapping_newline},
-            "combined_spatial_end_idx": actual_spatial_end_idx, # Last index used by spatial/newline
+            # Base features (mapping based on actual tokens)
+            "base_feature": {
+                "start_idx": base_start_idx, "end_idx": base_end_idx,
+                "grid": (base_grid_size, base_grid_size), # Fixed grid size
+                "positions": mapping_base,
+                "actual_token_count": actual_base_token_count
+            },
+            # Patch features (mapping based on actual tokens onto calculated grid)
+            "patch_feature": {
+                "start_idx": actual_spatial_start_idx,
+                "end_idx": max(mapping_spatial.keys()) if mapping_spatial else -1,
+                "grid_for_visualization": (grid_rows_padded, grid_cols_padded), # Calculated padded grid
+                "grid_unpadded": (unpadded_grid_rows, unpadded_grid_cols),       # Calculated unpadded grid
+                "positions": mapping_spatial,
+                "actual_token_count": len(mapping_spatial)
+            },
+            # Newline features (mapping based on actual tokens)
+            "newline_feature": {
+                "start_idx": min(mapping_newline.keys()) if mapping_newline else -1,
+                "end_idx": max(mapping_newline.keys()) if mapping_newline else -1,
+                "positions": mapping_newline,
+                "actual_token_count": len(mapping_newline)
+            },
+            # Overall info
+            "combined_spatial_end_idx": actual_spatial_end_idx, # Last index used by spatial/newline tokens
+            "image_spans": image_spans, # Actual token spans found in input_ids
+            # Config and calculation details
             "patch_size": raw_patch_size,
-            "original_size": (image_size_orig_hw[1], image_size_orig_hw[0]), # W, H
-            "best_resolution": target_resolution_wh, # W, H
-            "padded_dimensions": padded_dimensions_wh, # W, H
-            "resized_dimensions": resized_dimensions_wh, # W, H
-            "image_spans": image_spans
+            "mapper_input_size_wh": (image_size_processed_hw[1], image_size_processed_hw[0]), # W, H of image passed to this func
+            "best_resolution_calculated_wh": target_resolution_wh_calc, # W, H - calculated target
+            "padded_dimensions_calculated_wh": padded_dimensions_wh_calc, # W, H - calculated padded size
+            "resized_dimensions_calculated_wh": resized_dimensions_wh_calc, # W, H - calculated resized size
         }
+
 
     # --------------------------------------------------------------------------
     # Core Engine Methods
@@ -389,43 +411,59 @@ class LLaVANextEngine:
 
     def build_inputs(
         self,
-        image: Union[str, Image.Image],
+        image_source: Union[str, Image.Image],
         prompt: str = "Describe this image in detail.",
-        conversation_format: bool = True
+        conversation_format: bool = True,
+        target_image_size: Optional[Tuple[int, int]] = None
     ) -> Dict[str, Any]:
         """
         Build model inputs, including tensors and feature mapping metadata.
-
-        Uses external utilities for image loading and LLaVA-Next feature mapping.
+        Optionally pre-resizes the image before passing to the processor.
 
         Args:
-            image (Union[str, Image.Image]): PIL Image object or path/URL to an image.
+            image_source (Union[str, Image.Image]): PIL Image object or path/URL to an image.
             prompt (str): Text prompt to accompany the image.
             conversation_format (bool): Whether to use the LLaVA conversation format.
+            target_image_size (Optional[Tuple[int, int]]): If provided (as W, H),
+                pre-resizes the image to this size before processor handles it.
+                Defaults to None, using the original image size.
 
         Returns:
-            Dict[str, Any]: Dictionary containing:
-                - 'inputs': Dict of tensors for the model ('input_ids', 'pixel_values', etc.).
-                - 'feature_mapping': Dict with spatial mapping info (output of create_feature_mapping).
-                - 'original_image': The loaded PIL image.
-                - 'spatial_preview_image': The resized+padded PIL image for visualization.
+            Dict[str, Any]: Dictionary containing inputs, feature mapping, original image,
+                            and spatial preview image (based on the image passed to processor).
 
         Raises:
-            ValueError: If the model or processor is not loaded or config is missing.
+            ValueError: If model/processor not loaded or config missing.
+            RuntimeError: If required utilities are missing.
         """
         if self.model is None or self.processor is None:
             raise ValueError("Model and processor must be loaded before building inputs.")
         if not callable(load_image) or not callable(build_conversation):
              raise RuntimeError("Required data utility functions (load_image, build_conversation) are not available.")
 
-        # Load original image using utility
-        original_image = load_image(image, resize_to=None, verbose=False)
-        original_size_hw = (original_image.height, original_image.width)
+        # --- Load and Optionally Pre-Resize Image ---
+        try:
+            print(f"Loading image. Target size before processor: {target_image_size or 'Original'}")
+            # Load the image using the utility, applying pre-resizing if specified
+            img_to_process = load_image(
+                image_source,
+                resize_to=target_image_size, # Pass target size here
+                verbose=False
+            )
+            image_size_passed_to_processor = img_to_process.size # W, H
+            print(f"Image size passed to processor: {image_size_passed_to_processor}")
+            # Keep original image separate if resized, otherwise it's the same
+            original_image = load_image(image_source, resize_to=None, verbose=False) if target_image_size else img_to_process
 
-        # Build conversation structure using utility
+        except Exception as img_err:
+            print(f"Error loading/resizing image: {img_err}")
+            raise ValueError(f"Failed to load or resize image from {image_source}") from img_err
+        # ---
+
+        # Build conversation structure
         conversation = build_conversation(prompt, conversation_format=conversation_format)
 
-        # Format prompt text using chat template (remains same)
+        # Format prompt text using chat template
         try:
             if hasattr(self.processor, "apply_chat_template") and getattr(self.processor, 'chat_template', None):
                 formatted_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
@@ -433,49 +471,57 @@ class LLaVANextEngine:
                 image_token = getattr(getattr(self.processor, "tokenizer", self.processor), "image_token", "<image>")
                 text_content = prompt
                 if conversation_format and isinstance(conversation, list) and conversation and isinstance(conversation[0], dict) and 'content' in conversation[0]:
-                     text_items = [item.get('text', '') for item in conversation[0]['content'] if isinstance(item, dict) and item.get('type') == 'text']
-                     if text_items: text_content = text_items[0]
+                    text_items = [item.get('text', '') for item in conversation[0]['content'] if isinstance(item, dict) and item.get('type') == 'text']
+                    if text_items: text_content = text_items[0]
                 formatted_prompt = f"USER: {image_token}\n{text_content} ASSISTANT:"
         except Exception as e:
-             print(f"Warning: Error applying chat template: {e}. Using basic prompt format.")
-             image_token = getattr(getattr(self.processor, "tokenizer", self.processor), "image_token", "<image>")
-             formatted_prompt = f"USER: {image_token}\n{prompt} ASSISTANT:"
+            print(f"Warning: Error applying chat template: {e}. Using basic prompt format.")
+            image_token = getattr(getattr(self.processor, "tokenizer", self.processor), "image_token", "<image>")
+            formatted_prompt = f"USER: {image_token}\n{prompt} ASSISTANT:"
 
-        # Process image and text using the processor
-        inputs_dict = self.processor(
-            images=original_image,
-            text=formatted_prompt,
-            return_tensors="pt"
-        )
+        # --- Process Image and Text ---
+        # Pass the potentially pre-resized image to the processor
+        try:
+            inputs_dict = self.processor(
+                images=img_to_process, # Use the (potentially resized) image
+                text=formatted_prompt,
+                return_tensors="pt"
+            )
+        except Exception as proc_err:
+            print(f"Error during processor call: {proc_err}")
+            raise RuntimeError("LLaVA processor failed.") from proc_err
+        # ---
 
-        # Compute feature mapping based on the processed input_ids
-        feature_mapping = self.create_feature_mapping(inputs_dict['input_ids'], original_size_hw)
+        # --- Compute Feature Mapping ---
+        # Pass the size of the image *that was given to the processor* (H, W format)
+        # This is needed for select_best_resolution inside create_feature_mapping
+        image_size_hw_for_mapping = tuple(reversed(image_size_passed_to_processor)) # Convert W,H to H,W
+        feature_mapping = self.create_feature_mapping(inputs_dict['input_ids'], image_size_hw_for_mapping)
+        # ---
 
-        # Compute spatial preview image using the engine method (which calls the utility)
-        spatial_preview_image = self.compute_spatial_preview_image(original_image)
+        # Compute spatial preview image using the potentially resized image
+        # This reflects the input the processor actually saw for patching/gridding calculation
+        spatial_preview_image = self.compute_spatial_preview_image(img_to_process)
 
         # Move tensors to the correct device
         try:
-             model_device = self.model.device
-             inputs_on_device = {k: v.to(model_device) for k, v in inputs_dict.items() if isinstance(v, torch.Tensor)}
+            # Try model's device first if multi-GPU, else engine's default device
+            target_device = self.model.device if hasattr(self.model, 'hf_device_map') else self.device
+            inputs_on_device = {k: v.to(target_device) for k, v in inputs_dict.items() if isinstance(v, torch.Tensor)}
         except Exception as e:
-             print(f"Warning: Failed to move inputs to model device {getattr(self.model, 'device', 'N/A')}. Error: {e}. Using engine default {self.device}.")
-             try:
-                inputs_on_device = {k: v.to(self.device) for k, v in inputs_dict.items() if isinstance(v, torch.Tensor)}
-             except Exception as inner_e:
-                  print(f"Warning: Also failed to move inputs to engine device {self.device}. Inputs remain on CPU. Error: {inner_e}")
-                  inputs_on_device = {k: v for k, v in inputs_dict.items() if isinstance(v, torch.Tensor)} # Keep on CPU
+            print(f"Warning: Failed to move inputs to device {target_device}. Error: {e}. Inputs may remain on CPU.")
+            inputs_on_device = {k: v for k, v in inputs_dict.items() if isinstance(v, torch.Tensor)} # Keep on CPU if move fails
 
-        # Ensure non-tensor items are also included
+        # Ensure non-tensor items are included (e.g., potentially 'image_sizes' added by processor)
         for k, v in inputs_dict.items():
             if k not in inputs_on_device: inputs_on_device[k] = v
-
 
         return {
             "inputs": inputs_on_device,
             "feature_mapping": feature_mapping,
-            "original_image": original_image,
-            "spatial_preview_image": spatial_preview_image
+            "original_image": original_image, # The true original image
+            "processed_image_input": img_to_process, # The image passed to the processor
+            "spatial_preview_image": spatial_preview_image # Preview based on processed_image_input
         }
 
     def forward(
