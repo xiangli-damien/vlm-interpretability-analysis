@@ -155,14 +155,13 @@ class ActivationCache(HookManager):
 
 
 # --- Gradient Attention Capture (Forward + Backward) ---
-# --- Gradient Attention Capture (MODIFIED) ---
 class GradientAttentionCapture(HookManager):
     """
     Captures gradients flowing through attention modules for saliency analysis.
     Includes the saliency computation logic directly, similar to original notebook.
     Implements the HookManager protocol.
     """
-    def __init__(self, cpu_offload_grads: bool = False, cpu_offload_saliency: bool = True): # Added saliency offload option
+    def __init__(self, cpu_offload_grads: bool = False, cpu_offload_saliency: bool = True):
         """
         Initializes the gradient capturer.
 
@@ -178,10 +177,11 @@ class GradientAttentionCapture(HookManager):
         self._backward_hooks: List[torch.utils.hooks.RemovableHandle] = []
         self._tensor_grad_hooks: List[torch.utils.hooks.RemovableHandle] = []
         self.cpu_offload_grads = cpu_offload_grads
-        self.cpu_offload_saliency = cpu_offload_saliency # Store option
-        # Track layers hooked in the current registration cycle
+        self.cpu_offload_saliency = cpu_offload_saliency # <<< STORE THE ARGUMENT
         self._currently_hooked_layers: set[str] = set()
+        # Make the init print reflect both options
         print(f"Initialized GradientAttentionCapture (Offload Grads: {self.cpu_offload_grads}, Offload Saliency: {self.cpu_offload_saliency})")
+
 
 
     def _forward_hook_fn(self, layer_name: str):
