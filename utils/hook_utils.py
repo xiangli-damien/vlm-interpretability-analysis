@@ -157,188 +157,139 @@ class ActivationCache(HookManager):
 # --- Gradient Attention Capture (Forward + Backward) ---
 class GradientAttentionCapture(HookManager):
     """
-    Captures gradients flowing through attention modules for saliency analysis.
-    Includes the saliency computation logic directly, similar to original notebook.
-    Implements the HookManager protocol.
+    Captures attention weights and gradients.
+    Provides a compute_saliency method similar to implied old working version.
     """
-    def __init__(self, cpu_offload_grads: bool = False, cpu_offload_saliency: bool = True):
+    def __init__(self, cpu_offload: bool = True): # Only cpu_offload argument
         """
         Initializes the gradient capturer.
 
         Args:
-            cpu_offload_grads (bool): If True, move captured gradients to CPU immediately
-                                      after capture. Defaults to False.
-            cpu_offload_saliency (bool): If True, move computed saliency scores to CPU
-                                         before returning. Defaults to True.
+            cpu_offload (bool): If True, computed saliency scores are moved to CPU.
         """
-        self.attention_weights: Dict[str, torch.Tensor] = {} # Stores weights from forward
-        self.attention_grads: Dict[str, torch.Tensor] = {}   # Stores grads from backward
+        self.attention_weights: Dict[str, torch.Tensor] = {}
+        self.attention_grads: Dict[str, torch.Tensor] = {}
         self._forward_hooks: List[torch.utils.hooks.RemovableHandle] = []
         self._backward_hooks: List[torch.utils.hooks.RemovableHandle] = []
-        self._tensor_grad_hooks: List[torch.utils.hooks.RemovableHandle] = []
-        self.cpu_offload_grads = cpu_offload_grads
-        self.cpu_offload_saliency = cpu_offload_saliency # <<< STORE THE ARGUMENT
-        self._currently_hooked_layers: set[str] = set()
-        # Make the init print reflect both options
-        print(f"Initialized GradientAttentionCapture (Offload Grads: {self.cpu_offload_grads}, Offload Saliency: {self.cpu_offload_saliency})")
+        self._tensor_grad_hooks: Dict[str, torch.utils.hooks.RemovableHandle] = {}
+        self._hooked_layers: Set[str] = set()
+        self.cpu_offload = cpu_offload # Assume this applies to saliency scores now
+        print(f"[DEBUG] Initialized OldStyle GradientAttentionCapture (CPU Offload Saliency: {self.cpu_offload})")
 
-
-
-    def _forward_hook_fn(self, layer_name: str):
-        """Creates a forward hook to STORE the attention weights tensor."""
-        # (Implementation remains the same as previous corrected version)
+    # --- _create_forward_hook_fn (Use robust version) ---
+    def _create_forward_hook_fn(self, layer_name: str) -> Callable:
         def hook(module, input, output):
+            # print(f"[DEBUG] Forward Hook Fired: {layer_name}")
             attn_weights = None
-            if isinstance(output, tuple):
+            if isinstance(output, tuple): # Find weights logic
                 if len(output) > 2 and isinstance(output[2], torch.Tensor) and output[2].ndim >= 4 and output[2].shape[-1] == output[2].shape[-2]: attn_weights = output[2]
                 elif len(output) > 1 and isinstance(output[1], torch.Tensor) and output[1].ndim >= 4 and output[1].shape[-1] == output[1].shape[-2]: attn_weights = output[1]
             if attn_weights is not None and attn_weights.requires_grad:
+                # print(f"  [DEBUG] {layer_name}: Storing weights {attn_weights.shape}")
                 self.attention_weights[layer_name] = attn_weights
         return hook
 
-    def _backward_hook_fn(self, layer_name: str):
-        """Creates a backward hook (for module) that registers a *tensor* hook."""
-        # (Implementation remains the same as previous corrected version)
-        def hook(module, grad_input, grad_output):
+    # --- _create_backward_hook_fn (Use robust version) ---
+    def _create_backward_hook_fn(self, layer_name: str) -> Callable:
+        def module_backward_hook(module, grad_input, grad_output):
+            # print(f"[DEBUG] Backward Hook Fired: {layer_name}")
             if layer_name in self.attention_weights:
                 attn_weights_tensor = self.attention_weights[layer_name]
-                def _capture_grad(grad):
-                    if grad is not None:
-                        processed_grad = grad.detach()
-                        if self.cpu_offload_grads: processed_grad = processed_grad.cpu()
-                        self.attention_grads[layer_name] = processed_grad
                 if attn_weights_tensor.requires_grad:
-                   handle = attn_weights_tensor.register_hook(_capture_grad)
-                   self._tensor_grad_hooks.append(handle)
-        return hook
+                    def _capture_tensor_grad(grad):
+                        # print(f"[DEBUG] Tensor Grad Hook Called: {layer_name}")
+                        if grad is not None:
+                            # print(f"  [DEBUG] {layer_name}: Storing grad {grad.shape}")
+                            # Store grad on original device, offload handled in compute_saliency
+                            self.attention_grads[layer_name] = grad.detach()
 
-    def register_hooks(self, model: torch.nn.Module, layer_names: List[str]) -> None:
-        """Registers forward and backward hooks on specified layers."""
-        # Don't clear data here, only hooks from previous registrations
-        self.clear_hooks()
-        self._currently_hooked_layers = set(layer_names) # Track layers for this cycle
+                    if layer_name not in self._tensor_grad_hooks: # Avoid re-registering
+                         handle = attn_weights_tensor.register_hook(_capture_tensor_grad)
+                         self._tensor_grad_hooks[layer_name] = handle
+                         # print(f"  [DEBUG] {layer_name}: Registered tensor hook.")
+        return module_backward_hook
 
-        if not layer_names:
-            print("GradientAttentionCapture: No layer names provided to register hooks.")
-            return
-        # (Rest of the registration logic remains the same as previous corrected version)
-        registered_fwd = 0
-        registered_bwd = 0
+    # --- register_hooks (Use robust version) ---
+    def register_hooks(self, model: torch.nn.Module, layer_names: List[str]):
+        self.clear_hooks() # Clear only hooks
+        self._hooked_layers = set(layer_names)
+        print(f"[DEBUG] OldStyle Registering hooks for layers: {list(self._hooked_layers)}")
+        # (Loop and register forward/backward hooks as before)
+        registered_fwd = 0; registered_bwd = 0
         for layer_name in layer_names:
-            module = None
-            # ... (try getting module as before) ...
-            try: # Simplified get_module_by_name logic
-                names = layer_name.split('.'); module = model
-                for n in names: module = module[int(n)] if n.isdigit() else getattr(module, n)
-            except Exception: module = None
+             module = None # Get module
+             try: names = layer_name.split('.'); module = model; # ... (rest of get module) ...
+             except Exception: module = None
+             if module is not None:
+                 f_handle = module.register_forward_hook(self._create_forward_hook_fn(layer_name)); self._forward_hooks.append(f_handle); registered_fwd+=1
+                 b_handle = module.register_full_backward_hook(self._create_backward_hook_fn(layer_name)); self._backward_hooks.append(b_handle); registered_bwd+=1
+             # else: print(...) # Optional warning
+        # print(f"Registered {registered_fwd} fwd / {registered_bwd} bwd hooks.")
+        return self # Return self as expected by old workflow
 
-            if module is not None:
-                f_handle = module.register_forward_hook(self._forward_hook_fn(layer_name))
-                self._forward_hooks.append(f_handle); registered_fwd += 1
-                b_handle = module.register_full_backward_hook(self._backward_hook_fn(layer_name))
-                self._backward_hooks.append(b_handle); registered_bwd += 1
-            else:
-                print(f"Warning: Module '{layer_name}' not found. Cannot register hooks.")
-        print(f"GradientAttentionCapture: Registered {registered_fwd} fwd / {registered_bwd} bwd hooks for {len(layer_names)} layers.")
-
-    # *** NEW METHOD: Based on original compute_saliency_scores ***
-    def compute_saliency_scores_and_clear(self) -> Dict[str, torch.Tensor]:
+    # *** ADDED: compute_saliency method as called by old workflow ***
+    def compute_saliency(self) -> Dict[str, torch.Tensor]:
         """
-        Computes saliency = |attention * gradient| for the layers hooked in the
-        *current registration cycle* where both weights and grads were captured.
-        Clears the captured weights and grads for the processed layers afterwards.
-
-        Returns:
-            Dict[str, torch.Tensor]: Dictionary mapping layer names to computed saliency tensors.
-                                      Tensors are detached and potentially on CPU.
+        Computes saliency = |attention * gradient| for layers where both were captured.
+        Does NOT automatically clear the captured weights/grads here.
         """
         saliency_scores: Dict[str, torch.Tensor] = {}
-        # Process only the layers that were intended to be hooked in this cycle
-        # And for which we actually captured both weights and grads
-        processable_layers = list(self._currently_hooked_layers & self.attention_weights.keys() & self.attention_grads.keys())
+        # Process layers that have BOTH weights and grads stored from the *last* backward
+        processable_layers = list(self.attention_weights.keys() & self.attention_grads.keys())
 
+        # Filter based on layers hooked in the *current* cycle for safety
+        processable_layers = [ln for ln in processable_layers if ln in self._hooked_layers]
+
+        # print(f"[DEBUG] compute_saliency: Will compute for {len(processable_layers)} layers.") # Debug
         if not processable_layers:
-            print("Compute Saliency: No layers found with both weights and grads captured for the current cycle.")
-            # Still clear any potentially captured data for the hooked layers
-            self._clear_data_for_layers(self._currently_hooked_layers)
-            self._currently_hooked_layers.clear()
-            return {}
+             # Don't clear anything here, let the workflow manage clearing after the step
+             return {}
 
-        print(f"Compute Saliency: Calculating for {len(processable_layers)} layers...")
         calculated_count = 0
         for layer_name in processable_layers:
             attn_weights = self.attention_weights[layer_name]
             grad = self.attention_grads[layer_name]
 
-            # Device check/move (same as in standalone calculate_saliency_scores)
-            if attn_weights.device != grad.device:
-                print(f"  Saliency Calc Warning: Device mismatch layer '{layer_name}'! W:{attn_weights.device}, G:{grad.device}. Moving grad.")
-                try: grad = grad.to(attn_weights.device)
-                except Exception as e: print(f"  Error moving grad: {e}. Skip."); continue
-            # Shape check
-            if attn_weights.shape != grad.shape:
-                 print(f"  Saliency Calc Warning: Shape mismatch layer '{layer_name}'! W:{attn_weights.shape}, G:{grad.shape}. Skip."); continue
+            # (Device/Shape checks as before)
+            if attn_weights.device != grad.device: 
+                try: grad=grad.to(attn_weights.device) 
+                except Exception: continue
+            if attn_weights.shape != grad.shape: continue
 
             try:
                 saliency = torch.abs(attn_weights.float() * grad.float()).detach()
-                if self.cpu_offload_saliency:
+                if self.cpu_offload: # Use the single offload flag
                     saliency = saliency.cpu()
                 saliency_scores[layer_name] = saliency
                 calculated_count += 1
-            except Exception as e:
-                print(f"  Saliency Calc Error: Failed for layer '{layer_name}': {e}. Skip.")
+            except Exception as e: print(f"Calc error {layer_name}: {e}")
 
-            # *** IMPORTANT: Clean up data for this layer *after* processing ***
-            del self.attention_weights[layer_name]
-            del self.attention_grads[layer_name]
-
-        print(f"Compute Saliency: Calculated scores for {calculated_count} layers.")
-        # Clear any remaining data for layers that were hooked but maybe didn't get grads etc.
-        self._clear_data_for_layers(self._currently_hooked_layers - set(processable_layers))
-        self._currently_hooked_layers.clear() # Clear the tracking set for the next cycle
-        gc.collect() # Add garbage collection here
+        # print(f"Computed saliency for {calculated_count} layers.") # Debug
+        # *** DO NOT CLEAR self.attention_weights or self.attention_grads here ***
+        # Let the caller manage clearing the overall object state if needed.
         return saliency_scores
 
-    def _clear_data_for_layers(self, layer_names_to_clear: set[str]):
-        """Helper to remove captured data for specific layers."""
-        for layer_name in layer_names_to_clear:
-            self.attention_weights.pop(layer_name, None)
-            self.attention_grads.pop(layer_name, None)
-
-    # Keep get_captured_data for potential other uses, but it doesn't clear hooks
-    def get_captured_data(self) -> Dict[str, Any]:
-        """Returns captured attention weights and gradients *without* clearing hooks."""
-        # Return copies
-        data = {
-            "attention_weights": self.attention_weights.copy(),
-            "attention_grads": self.attention_grads.copy()
-        }
-        # DO NOT CLEAR DATA OR HOOKS HERE in this version
-        return data
-
-    def _clear_tensor_grad_hooks(self) -> None:
-        # (Implementation remains the same)
-        for handle in self._tensor_grad_hooks: handle.remove()
-        self._tensor_grad_hooks = []
-
-    def clear_hooks(self) -> None:
-        # (Implementation remains the same)
+    # --- clear_hooks (remains the same) ---
+    def clear_hooks(self):
+        # print(f"Removing {len(self._forward_hooks)} Fwd, {len(self._backward_hooks)} Bwd, {len(self._tensor_grad_hooks)} Tensor hooks...")
         for handle in self._forward_hooks: handle.remove()
-        self._forward_hooks = []
         for handle in self._backward_hooks: handle.remove()
-        self._backward_hooks = []
-        self._clear_tensor_grad_hooks()
-        self._currently_hooked_layers.clear() # Also clear the tracking set
+        for handle in self._tensor_grad_hooks.values(): handle.remove()
+        self._forward_hooks = []; self._backward_hooks = []; self._tensor_grad_hooks = {}
+        self._hooked_layers = set()
 
-    def clear(self) -> None:
-        """Clears captured data AND removes all hooks."""
-        self.clear_hooks() # Removes hooks and clears _currently_hooked_layers
+    # Add explicit clear_cache if needed by workflow
+    def clear_cache(self):
         self.attention_weights = {}
         self.attention_grads = {}
         gc.collect()
-        print("GradientAttentionCapture: Cleared ALL data and hooks.")
+
+    # Add clear method if workflow really needs it
+    def clear(self):
+         self.clear_hooks()
+         self.clear_cache()
 
     def requires_gradient(self) -> bool: return True
     def __del__(self): self.clear_hooks()
     def __enter__(self): return self
-    def __exit__(self, exc_type, exc_value, traceback): self.clear_hooks() # Use clear_hooks on exit
+    def __exit__(self,et,ev,tb): self.clear_hooks()
