@@ -568,11 +568,6 @@ def run_saliency_workflow(
 
 
 
-# ==============================================================================
-#     Workflow 3: Saliency Analysis (Memory Optimized - New Function)
-# ==============================================================================
-
-
 def run_saliency_workflow_memory_optimized(
     engine: LLaVANextEngine,
     image_source: Union[str, Image.Image],
@@ -581,15 +576,16 @@ def run_saliency_workflow_memory_optimized(
     output_dir: str = "saliency_analysis_mem_opt",
     layer_batch_size: int = 1, # How many layers to process per backward pass
     save_plots: bool = True,
-    target_image_size: Optional[Tuple[int, int]] = None # Added (W, H)
+    target_image_size: Optional[Tuple[int, int]] = None,
+    # *** NEW: Option to control saliency offload within hook manager ***
+    cpu_offload_saliency: bool = True
 ) -> Dict[str, Any]:
     """
     Performs saliency analysis using batched forward/backward passes.
-    Allows specifying a target_image_size for potential memory saving.
-    Modified to accumulate weights/grads before calculating saliency per step.
+    Uses GradientAttentionCapture.compute_saliency_scores_and_clear internally.
     """
-    print(f"\n--- Starting Memory-Optimized Saliency Workflow ---")
-    print(f" Config: NumTokens={num_tokens}, LayerBatch={layer_batch_size}, TargetImageSize(WxH)={target_image_size or 'Default'}")
+    print(f"\n--- Starting Memory-Optimized Saliency Workflow (Original Logic Style) ---")
+    print(f" Config: NumTokens={num_tokens}, LayerBatch={layer_batch_size}, TargetImageSize(WxH)={target_image_size or 'Default'}, OffloadSaliency={cpu_offload_saliency}")
     if save_plots: os.makedirs(output_dir, exist_ok=True)
     final_results = {"error": "Workflow did not complete."}
     start_time = time.time()
@@ -601,21 +597,17 @@ def run_saliency_workflow_memory_optimized(
     if not any(p.requires_grad for p in model.parameters()): print("Warning: No model parameters require grad.")
 
     try:
-        # --- 1. Initial Setup ---
+        # --- 1. Initial Setup (remains the same) ---
         print(" Step 1: Preparing initial inputs...")
-        step_start_inner = time.time()
+        # ... (input prep, token index finding, layer name getting logic as before) ...
         prepared_data = engine.build_inputs(image_source, prompt_text, target_image_size=target_image_size)
-        initial_inputs = prepared_data['inputs']
-        pixel_values = initial_inputs["pixel_values"]
-        image_sizes = initial_inputs.get("image_sizes")
+        initial_inputs = prepared_data['inputs']; pixel_values = initial_inputs["pixel_values"]; image_sizes = initial_inputs.get("image_sizes")
         initial_input_ids = initial_inputs["input_ids"]
-        print(f" Initial input_ids shape: {initial_input_ids.shape}")
         image_token_id = engine.get_config("image_token_id")
         text_indices, image_indices = get_token_indices(initial_input_ids.cpu(), image_token_id)
-        print(f" Found {len(text_indices)} text, {len(image_indices)} image tokens after processing.")
         all_attn_layer_names = engine.get_attention_layer_names()
-        if not all_attn_layer_names: raise ValueError("Could not find attention layers via engine.")
-        print(f" Identified {len(all_attn_layer_names)} attention layers. (Setup took {time.time()-step_start_inner:.2f}s)")
+        if not all_attn_layer_names: raise ValueError("Could not find attention layers.")
+        print(f" Setup complete. Text={len(text_indices)}, Image={len(image_indices)}, Layers={len(all_attn_layer_names)}")
 
         # --- Main Loop ---
         token_results = {}
@@ -627,10 +619,8 @@ def run_saliency_workflow_memory_optimized(
         for step_idx in tqdm(range(num_tokens), desc="Analyzing Tokens", ncols=100):
             step_start_inner = time.time()
             current_step_results = {}
-            # *** MODIFICATION: Accumulate weights/grads for the whole step ***
-            step_attention_weights = {}
-            step_attention_grads = {}
-            # **************************************************************
+            # *** MODIFICATION: Saliency scores accumulated per step ***
+            all_saliency_scores_step = {}
             next_token_id = None
             loss_val = None
 
@@ -638,155 +628,119 @@ def run_saliency_workflow_memory_optimized(
             model.eval()
             try:
                 with torch.inference_mode():
-                    outputs_pred = model(
-                        input_ids=current_input_ids, attention_mask=current_attention_mask,
-                        pixel_values=pixel_values, image_sizes=image_sizes, use_cache=True
-                    )
-                    logits = outputs_pred.logits[:, -1, :]
-                    next_token_id = torch.argmax(logits, dim=-1)
-                    log_probs = torch.log_softmax(logits.float(), dim=-1)
-                    loss_val = -log_probs[0, next_token_id.item()].item()
+                    outputs_pred = model(input_ids=current_input_ids, attention_mask=current_attention_mask, pixel_values=pixel_values, image_sizes=image_sizes, use_cache=True)
+                    logits = outputs_pred.logits[:, -1, :]; next_token_id = torch.argmax(logits, dim=-1)
+                    log_probs = torch.log_softmax(logits.float(), dim=-1); loss_val = -log_probs[0, next_token_id.item()].item()
                     del outputs_pred, logits, log_probs; gc.collect(); torch.cuda.empty_cache()
-            except Exception as pred_err:
-                print(f"\nError during next token prediction step {step_idx+1}: {pred_err}")
-                final_results["error"] = f"Prediction failed step {step_idx+1}: {pred_err}"
-                token_results[f"token_{step_idx+1}"] = {"error": f"Prediction failed: {pred_err}"}
-                break # Exit loop on prediction failure
-            if next_token_id is None: print(f"\nFailed token generation step {step_idx+1}. Stop."); break
+            except Exception as pred_err: print(f"\nPred Err step {step_idx+1}: {pred_err}"); final_results["error"] = "..."; break
+            if next_token_id is None: print(f"\nToken gen failed step {step_idx+1}."); break
             new_token_text = processor.tokenizer.decode([next_token_id.item()])
             print(f"\n Step {step_idx+1}/{num_tokens}: Gen='{new_token_text}' (ID:{next_token_id.item()}), Loss={loss_val:.4f}")
 
-
-            # B. Compute Gradients (Batched Layer Loop)
+            # B. Compute Gradients and Saliency (Batched Layer Loop)
             model.train()
             # Instantiate Hook Manager *once* per step
-            grad_capture = GradientAttentionCapture(cpu_offload_grads=True) # Offload grads immediately
+            # Pass the saliency offload option
+            grad_capture = GradientAttentionCapture(cpu_offload_grads=True, cpu_offload_saliency=cpu_offload_saliency)
             num_layers = len(all_attn_layer_names)
             try:
-                print(f"  Calculating gradients for step {step_idx+1}...")
+                print(f"  Calculating gradients & saliency for step {step_idx+1}...")
                 for batch_start in range(0, num_layers, layer_batch_size):
                     batch_end = min(batch_start + layer_batch_size, num_layers)
                     current_layer_batch_names = all_attn_layer_names[batch_start:batch_end]
-                    # print(f"    Processing layer batch {batch_start//layer_batch_size + 1}: {current_layer_batch_names}") # Verbose
 
                     model.zero_grad(set_to_none=True)
                     # Register hooks ONLY for the current batch
                     grad_capture.register_hooks(model, current_layer_batch_names)
+                    loss = None
+                    try: # Inner try for forward/backward
+                        with torch.enable_grad():
+                            outputs_grad = model(input_ids=current_input_ids, attention_mask=current_attention_mask, pixel_values=pixel_values, image_sizes=image_sizes, use_cache=False, output_attentions=True)
+                            logits_grad = outputs_grad.logits[:, -1, :]; log_probs_grad = torch.log_softmax(logits_grad.float(), dim=-1)
+                            loss = -log_probs_grad[0, next_token_id.item()]
 
-                    with torch.enable_grad():
-                        outputs_grad = model(
-                            input_ids=current_input_ids, attention_mask=current_attention_mask,
-                            pixel_values=pixel_values, image_sizes=image_sizes,
-                            use_cache=False, output_attentions=True
-                        )
-                        logits_grad = outputs_grad.logits[:, -1, :] # Logits for predicted token's position
-                        log_probs_grad = torch.log_softmax(logits_grad.float(), dim=-1)
-                        loss = -log_probs_grad[0, next_token_id.item()] # Loss for the predicted token
+                        del outputs_grad, logits_grad, log_probs_grad # Cleanup before backward
+                        gc.collect(); torch.cuda.empty_cache()
 
-                    # Compute gradients for this batch
-                    loss.backward() # Hooks capture gradients here
+                        loss.backward() # Compute gradients for batch
 
-                    # *** MODIFICATION: Get data and accumulate ***
-                    batch_data = grad_capture.get_captured_data() # Retrieve captured data FOR THIS BATCH
-                    step_attention_weights.update(batch_data.get("attention_weights", {}))
-                    step_attention_grads.update(batch_data.get("attention_grads", {}))
-                    # ********************************************
+                        # *** MODIFICATION: Compute saliency using the hook manager's method ***
+                        # This call now computes saliency AND clears data for the processed layers
+                        batch_saliency = grad_capture.compute_saliency_scores_and_clear()
+                        all_saliency_scores_step.update(batch_saliency)
+                        # ***********************************************************************
 
-                    # VERY IMPORTANT: Clear hooks *after each batch* to prevent interference
-                    grad_capture.clear_hooks()
+                    except Exception as backward_err: raise backward_err # Re-raise
+                    finally:
+                        # Ensure hooks are cleared and loss is deleted for the batch
+                        grad_capture.clear_hooks() # <<< IMPORTANT: Clear hooks after batch backward/saliency compute
+                        if 'loss' in locals() and loss is not None: del loss
+                        gc.collect(); torch.cuda.empty_cache()
 
-                    # Cleanup batch-specific tensors
-                    del outputs_grad, logits_grad, log_probs_grad, loss, batch_data
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-                # C. Calculate Saliency Scores for the completed step (using accumulated data)
-                print(f"  Calculating saliency scores for step {step_idx+1}...")
-                all_saliency_scores_step = calculate_saliency_scores(step_attention_weights, step_attention_grads)
-
-                # D. Analyze flow (using step's saliency scores)
-                model.eval() # Back to eval mode
-                target_idx = current_input_ids.shape[1] - 1 # Index *before* the generated token
+                # C. Analyze flow (using step's saliency scores)
+                model.eval()
+                target_idx = current_input_ids.shape[1] - 1
                 if not all_saliency_scores_step:
-                    print(f"  Warning: No saliency scores generated for step {step_idx+1}, cannot analyze flow.")
-                    flow_metrics = {"error": "No saliency scores generated"}
+                     print(f"  Warning: No saliency scores generated step {step_idx+1}."); flow_metrics = {"error": "No saliency scores"}
                 else:
                     print(f"  Analyzing saliency flow for step {step_idx+1}...")
-                    flow_metrics = analyze_layerwise_saliency_flow(
-                        saliency_scores=all_saliency_scores_step,
-                        text_indices=text_indices.cpu(), # Use CPU indices
-                        image_indices=image_indices.cpu(),# Use CPU indices
-                        target_token_idx=target_idx,
-                        cpu_offload=True
-                    )
+                    flow_metrics = analyze_layerwise_saliency_flow(all_saliency_scores_step, text_indices.cpu(), image_indices.cpu(), target_idx, cpu_offload=True)
 
-                # E. Save plots (remains the same)
-                if save_plots and isinstance(flow_metrics, dict) and 'error' not in flow_metrics:
+                # D. Save plots (remains the same)
+                if save_plots and isinstance(flow_metrics, dict) and 'error' not in flow_metrics :
+                    # ... (plotting logic as before) ...
                     try:
-                        model_name_short = engine.model_id.split('/')[-1]
-                        safe_token_text = "".join(c if c.isalnum() else "_" for c in new_token_text.strip())
+                        model_name_short = engine.model_id.split('/')[-1]; safe_token_text = "".join(c if c.isalnum() else "_" for c in new_token_text.strip())
                         if not safe_token_text: safe_token_text = f"id{next_token_id.item()}"
-                        plot_filename = f"token_{(step_idx+1):02d}_{safe_token_text}_saliency_flow.png"
-                        step_plot_path = os.path.join(output_dir, plot_filename)
-                        plot_title = f"{model_name_short} - Saliency Flow for Token {step_idx+1} ('{new_token_text}') -> Pos {target_idx}"
-                        visualize_information_flow(flow_metrics, plot_title, step_plot_path)
-                        current_step_results["plot_path"] = step_plot_path
-                    except Exception as plot_err:
-                        print(f"    Warning: Error generating plot for step {step_idx+1}: {plot_err}")
-                        current_step_results["plot_path"] = f"Error: {plot_err}"
+                        plot_filename = f"token_{(step_idx+1):02d}_{safe_token_text}_saliency_flow.png"; step_plot_path = os.path.join(output_dir, plot_filename)
+                        plot_title = f"{model_name_short} - Saliency Flow Token {step_idx+1} ('{new_token_text}') -> Pos {target_idx}"
+                        visualize_information_flow(flow_metrics, plot_title, step_plot_path); current_step_results["plot_path"] = step_plot_path
+                    except Exception as plot_err: print(f" Plot Err: {plot_err}"); current_step_results["plot_path"] = f"Error: {plot_err}"
 
-                # F. Store results (remains the same)
-                current_step_results.update({
-                    "token_text": new_token_text,
-                    "token_id": next_token_id.item(),
-                    "loss": loss_val,
-                    "metrics": flow_metrics # Store the flow metrics computed from saliency
-                })
+
+                # E. Store results (remains the same)
+                current_step_results.update({"token_text": new_token_text,"token_id": next_token_id.item(),"loss": loss_val,"metrics": flow_metrics})
                 token_results[f"token_{step_idx+1}"] = current_step_results
 
-                # G. Prepare for next iteration (remains the same)
+                # F. Prepare for next iteration (remains the same)
                 current_input_ids = torch.cat([current_input_ids, next_token_id.unsqueeze(0)], dim=1)
                 new_mask_entry = torch.ones((1, 1), dtype=current_attention_mask.dtype, device=model.device)
                 current_attention_mask = torch.cat([current_attention_mask, new_mask_entry], dim=1)
                 generated_sequence += new_token_text
 
-            except Exception as step_err:
-                print(f"\nError during analysis of step {step_idx+1}: {step_err}")
+            except Exception as step_err: # Catch errors from B, C, D, E, F
+                print(f"\nError analyzing step {step_idx+1}: {step_err}")
                 import traceback; traceback.print_exc()
                 token_results[f"token_{step_idx+1}"] = {"error": f"Analysis failed: {step_err}"}
-                final_results["error"] = f"Analysis failed at step {step_idx+1}: {step_err}"
-                break # Stop the loop if analysis fails
+                final_results["error"] = f"Analysis failed step {step_idx+1}: {step_err}"
+                if 'grad_capture' in locals(): grad_capture.clear_hooks() # Ensure hooks cleared on error
+                break # Stop the loop
             finally:
-                # Ensure hooks are cleared even if error occurs within try block for B/C/D/E
-                if 'grad_capture' in locals(): grad_capture.clear()
-                # Clear step-specific accumulated data
-                del step_attention_weights, step_attention_grads, all_saliency_scores_step
+                # Final cleanup for the step
+                # grad_capture should be out of scope or hooks cleared already
+                if 'all_saliency_scores_step' in locals(): del all_saliency_scores_step
                 gc.collect(); torch.cuda.empty_cache()
                 print(f"  Step {step_idx+1} analysis finished in {time.time() - step_start_inner:.2f}s")
 
-        # --- End of Loop ---
+        # --- End of Loop & Final Results (fix AttributeError location) ---
         loop_end_time = time.time()
-        final_results = {
+        final_results = { # Collate results
             "token_results": token_results, "sequence_text": generated_sequence,
             "total_time": loop_end_time - start_time, "model_name": engine.model_id,
-            "config": { "num_tokens": num_tokens, "layer_batch_size": layer_batch_size, "prompt": prompt_text, "image_source": image_source if isinstance(image_source, str) else "PIL Input", "target_image_size": target_image_size },
+            "config": { "num_tokens": num_tokens, "layer_batch_size": layer_batch_size, "prompt": prompt_text, "image_source": image_source if isinstance(image_source, str) else "PIL Input", "target_image_size": target_image_size, "cpu_offload_saliency": cpu_offload_saliency },
             "error": final_results.get("error") # Preserve error if loop broke early
         }
-        # Set error to None only if loop completed fully without prior error
-        if final_results.get("error") is None and step_idx == num_tokens - 1:
-             final_results["error"] = None
-        elif final_results.get("error") is None: # Loop finished early but no specific error was set
-            print(f"\nWarning: Workflow loop stopped early at step {step_idx+1}/{num_tokens}.")
-            final_results["error"] = f"Loop stopped early at step {step_idx+1}"
-
+        if final_results.get("error") is None and step_idx == num_tokens - 1: final_results["error"] = None
+        elif final_results.get("error") is None: final_results["error"] = f"Loop stopped early step {step_idx+1}"
 
         print(f"\n--- Memory-Optimized Saliency Workflow Finished ({final_results['total_time']:.2f} seconds) ---")
 
     except Exception as e:
-        print(f"Error during Memory-Optimized Saliency workflow setup: {e}")
+        print(f"Error during Workflow setup/execution: {e}")
         import traceback; traceback.print_exc()
-        final_results["error"] = f"Workflow setup failed: {e}"
+        final_results["error"] = f"Workflow setup/exec failed: {e}"
     finally:
-        # Final cleanup
+        # Final Cleanup - No grad_capture expected here anymore
         if 'prepared_data' in locals(): del prepared_data
         if 'initial_inputs' in locals(): del initial_inputs
         gc.collect()
