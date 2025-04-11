@@ -210,183 +210,107 @@ class ActivationCache:
 
 
 # --- Gradient Attention Capture Implementation ---
-# Implicitly implements HookManager if all methods are defined
 class GradientAttentionCapture:
     """
-    Captures attention weights (forward pass) and their gradients (backward pass).
-    REQUIRES gradients to be computed during the model execution.
-    Implements the HookManager interface implicitly.
+    This class captures the gradients flowing through attention modules using forward
+    and full backward hooks. It stores both the attention weights and their gradients,
+    and it can be configured to offload gradients to CPU.
+    
+    Modification:
+    In the forward hook, if the attention weights do not have grad enabled, we force them
+    to require gradients (by calling `requires_grad_()`). This ensures that when we call
+    backward(), the gradients are computed so that the hook can capture them.
     """
-    def __init__(self, cpu_offload_grads: bool = True):
-        """
-        Initializes the GradientAttentionCapture.
-
-        Args:
-            cpu_offload_grads (bool): If True, move captured gradient tensors to CPU
-                                      immediately after capture. Defaults to True.
-                                      Attention weights stay on original device until get_captured_data.
-        """
-        # Stores attention weights tensor (requires_grad=True ideally) from forward pass
-        self.attention_weights: Dict[str, torch.Tensor] = {}
-        # Stores detached gradient tensors captured during backward pass
-        self.attention_grads: Dict[str, torch.Tensor] = {}
-        self._forward_hooks: List[torch.utils.hooks.RemovableHandle] = []
-        self._backward_hooks: List[torch.utils.hooks.RemovableHandle] = []
-        # Stores handles for hooks attached *directly to tensors* during backward pass
-        self._tensor_grad_hooks: Dict[str, torch.utils.hooks.RemovableHandle] = {}
-        self._hooked_layers: Set[str] = set()
+    def __init__(self, cpu_offload_grads: bool = False):
+        self.attention_weights = {}  # Mapping: layer name -> attention weight tensor
+        self.attention_grads = {}    # Mapping: layer name -> gradient tensor (captured)
+        self.forward_hooks = []      # Store forward hook handles
+        self.backward_hooks = []     # Store backward hook handles
         self.cpu_offload_grads = cpu_offload_grads
-        print(f"Initialized GradientAttentionCapture (Offload Grads: {self.cpu_offload_grads})")
 
-    def _create_forward_hook_fn(self, layer_name: str) -> Callable:
-        """Factory for the forward hook: captures attention weights *without detaching*."""
-        def forward_hook(module: nn.Module, input_args: Tuple[Any, ...], output: Any):
-            attn_weights: Optional[torch.Tensor] = None
-            # Try to find attention weights in output tuple (common HF patterns)
+    def _forward_hook_fn(self, layer_name: str):
+        """
+        Creates and returns a forward hook function that attempts to extract the attention weights.
+        If the tensor does not have gradients enabled, it forces it (via requires_grad_()).
+        """
+        def hook(module, input, output):
+            # Try to extract the attention weights from typical output positions.
+            attn_weights = None
             if isinstance(output, tuple):
-                if len(output) > 1 and isinstance(output[1], torch.Tensor) and output[1].ndim == 4:
+                # Some models return attention as the second element (e.g., output[1])
+                if len(output) >= 2 and isinstance(output[1], torch.Tensor):
                     attn_weights = output[1]
-                elif len(output) > 2 and isinstance(output[2], torch.Tensor) and output[2].ndim == 4:
+                # Alternatively, check the third element.
+                elif len(output) >= 3 and isinstance(output[2], torch.Tensor):
                     attn_weights = output[2]
+            elif isinstance(output, torch.Tensor):
+                attn_weights = output
 
             if attn_weights is not None:
-                # Warn if the captured attention tensor doesn't require gradients
+                # IMPORTANT: Ensure that the attention weights require gradients
                 if not attn_weights.requires_grad:
-                    print(f"Warning (GradCapture): Attention weights tensor for layer '{layer_name}' does not require grad. Gradients may not flow.")
-                # Store the original tensor (still attached to graph)
-                self.attention_weights[layer_name] = attn_weights
-            # else: # Reduce verbosity
-            #     print(f"GradCapture Warn: No attention weights found for grad capture layer '{layer_name}'.")
-        return forward_hook
+                    # Force the tensor to require gradients so that backward() can compute them.
+                    attn_weights.requires_grad_()
+                    # Optionally, call retain_grad() so that even if the tensor is not a leaf it will be retained.
+                    attn_weights.retain_grad()
+                # Store a detached copy of the attention weights (for reference)
+                self.attention_weights[layer_name] = attn_weights.detach()
+        return hook
 
-    def _create_backward_hook_fn(self, layer_name: str) -> Callable:
-        """Factory for the *module* backward hook: registers a *tensor* grad hook."""
-        def module_backward_hook(module: nn.Module, grad_input: Tuple[torch.Tensor, ...], grad_output: Tuple[torch.Tensor, ...]):
-            # Check if we captured weights for this layer in the forward pass
-            if layer_name in self.attention_weights:
-                attn_weights_tensor = self.attention_weights[layer_name]
-
-                # Check if tensor requires grad and if we haven't already registered a hook for it in *this* backward pass
-                if attn_weights_tensor.requires_grad and layer_name not in self._tensor_grad_hooks:
-
-                    # Define the function that will be called when the gradient for *this tensor* is computed
-                    def _capture_tensor_grad(grad: torch.Tensor):
-                        # Process and store the gradient
-                        processed_grad = grad.detach()
-                        if self.cpu_offload_grads:
-                            processed_grad = processed_grad.cpu()
-                        self.attention_grads[layer_name] = processed_grad
-
-                        # --- Crucial Cleanup ---
-                        # Remove the handle for *this specific tensor hook* after it fires.
-                        # This prevents it from firing again if backward() is called multiple times
-                        # on the same graph for some reason, or storing outdated grads.
-                        if layer_name in self._tensor_grad_hooks:
-                            # self._tensor_grad_hooks[layer_name].remove() # Potentially problematic if hooks list changes?
-                            del self._tensor_grad_hooks[layer_name] # Safer: just remove our reference
-                            # print(f"Debug: Tensor hook fired and removed for {layer_name}") # Optional debug
-
-                    # Register the hook directly on the attention weights tensor
-                    # This hook fires when the gradient *for this tensor* is computed
-                    handle = attn_weights_tensor.register_hook(_capture_tensor_grad)
-                    # Store the handle so we can potentially remove it later if backward isn't called
-                    self._tensor_grad_hooks[layer_name] = handle
-                    # print(f"Debug: Tensor hook registered for {layer_name}") # Optional debug
-        return module_backward_hook
-
-    # --- HookManager Interface Methods ---
-
-    def register_hooks(self, model: nn.Module, layer_names: List[str]):
-        """Registers forward and backward hooks on specified module layers."""
-        self.clear_hooks() # Clear previous hooks (module and tensor)
-        # Do NOT clear cache here, attention_weights are needed for the backward pass
-        self._hooked_layers = set(layer_names)
-        # print(f"GradientAttentionCapture: Registering hooks for {len(layer_names)} layers...")
-
-        hook_count = 0
-        not_found_count = 0
-        for name in layer_names:
-            module = get_module_by_name(model, name)
-            if module and isinstance(module, nn.Module):
-                # Register forward hook (captures weights)
-                f_handle = module.register_forward_hook(self._create_forward_hook_fn(name))
-                self._forward_hooks.append(f_handle)
-                # Register *module* backward hook (which in turn registers tensor hook)
-                # Use register_full_backward_hook for compatibility and access to grad_input/grad_output
-                b_handle = module.register_full_backward_hook(self._create_backward_hook_fn(name))
-                self._backward_hooks.append(b_handle)
-                hook_count += 1
-            else:
-                print(f"Warning (GradCapture): Module '{name}' not found.")
-                not_found_count += 1
-
-        # print(f"GradientAttentionCapture: Registered {hook_count * 2} module hooks.")
-        if not_found_count > 0:
-            print(f"Warning (GradCapture): Could not find {not_found_count} out of {len(layer_names)} requested modules.")
-        return self # Allow chaining
-
-    def requires_gradient(self) -> bool:
-        """GradientAttentionCapture requires gradients to function."""
-        return True
-
-    def get_captured_data(self) -> Dict[str, Any]:
+    def _backward_hook_fn(self, layer_name: str):
         """
-        Returns captured attention weights (detached) and gradients.
-        Gradients are typically available only after `loss.backward()` has been called.
-
-        IMPORTANT: This method now also clears the internal caches (`attention_weights`, `attention_grads`)
-                   after retrieving the data, making it suitable for step-wise analysis where
-                   each step requires fresh capture.
+        Creates and returns a backward hook function that, when the gradient is computed,
+        captures it and stores it in the attention_grads dictionary.
         """
-        # Return detached weights for safety, grads are already detached during capture
+        def hook(module, grad_input, grad_output):
+            if layer_name not in self.attention_weights:
+                return
+            attn_weights = self.attention_weights[layer_name]
+            def _capture_grad(grad):
+                grad_detached = grad.detach()
+                if self.cpu_offload_grads:
+                    grad_detached = grad_detached.cpu()
+                self.attention_grads[layer_name] = grad_detached
+            # Register a hook on the attention weights so that when they are backpropagated,
+            # the gradient is captured.
+            attn_weights.register_hook(_capture_grad)
+        return hook
+
+    def register_hooks(self, model: torch.nn.Module, layer_names: list):
+        """
+        Registers forward and backward hooks on the modules whose names match those in layer_names.
+        """
+        self.clear_hooks()
+        for name, module in model.named_modules():
+            if name in layer_names:
+                f_hook = module.register_forward_hook(self._forward_hook_fn(name))
+                # Use register_full_backward_hook() so that gradients from non-leaf nodes are captured.
+                b_hook = module.register_full_backward_hook(self._backward_hook_fn(name))
+                self.forward_hooks.append(f_hook)
+                self.backward_hooks.append(b_hook)
+        return self
+
+    def get_captured_data(self) -> dict:
+        """
+        Returns a dictionary containing the captured attention weights and gradients.
+        It then clears the internal stored hooks and data.
+        """
         data = {
-            "attention_weights": {k: v.detach() for k, v in self.attention_weights.items()},
-            "attention_grads": self.attention_grads # Gradients are already detached
+            "attention_weights": self.attention_weights.copy(),
+            "attention_grads": self.attention_grads.copy()
         }
-        # --- Crucial for Step-wise ---
-        # Clear internal caches after retrieving data to prepare for the next step.
-        self.clear_cache()
-        # ---
+        self.clear_hooks()
+        self.attention_weights.clear()
+        self.attention_grads.clear()
         return data
 
     def clear_hooks(self):
-        """Removes all registered module forward/backward hooks AND any pending tensor grad hooks."""
-        hooks_removed = 0
-        # Remove module forward hooks
-        for handle in self._forward_hooks: handle.remove(); hooks_removed += 1
-        # Remove module backward hooks
-        for handle in self._backward_hooks: handle.remove(); hooks_removed += 1
-        # Remove any tensor grad hooks that might not have fired (e.g., if backward wasn't called)
-        tensor_hooks_removed = 0
-        for handle in self._tensor_grad_hooks.values(): handle.remove(); tensor_hooks_removed += 1
-
-        # Clear internal lists/dictionaries
-        self._forward_hooks, self._backward_hooks, self._tensor_grad_hooks = [], [], {}
-        self._hooked_layers = set()
-        # if hooks_removed > 0 or tensor_hooks_removed > 0:
-        #     print(f"GradientAttentionCapture: Removed {hooks_removed} module hooks and {tensor_hooks_removed} pending tensor hooks.")
-
-    def clear_cache(self):
-        """Clears stored attention weights and gradients."""
-        # print("GradientAttentionCapture: Clearing cached weights and gradients...")
-        self.attention_weights, self.attention_grads = {}, {}
-        # gc.collect() # Optional GC
-
-    def clear(self):
-        """Clears both hooks and cached data."""
-        self.clear_hooks()
-        self.clear_cache()
-
-    # --- Context Manager Methods ---
-    def __enter__(self):
-        """Enter context manager."""
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Exit context manager: automatically removes hooks."""
-        self.clear_hooks()
-
-    # Destructor to ensure hooks are removed when object is garbage collected
-    def __del__(self):
-        """Attempt to clear hooks upon object deletion."""
-        self.clear_hooks()
+        """
+        Removes all registered forward and backward hooks.
+        """
+        for hook in self.forward_hooks:
+            hook.remove()
+        for hook in self.backward_hooks:
+            hook.remove()
+        self.forward_hooks = []
+        self.backward_hooks = []
