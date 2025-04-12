@@ -390,40 +390,91 @@ def run_saliency_workflow(
 
         # --- 2. Helper for Batched Gradient Computation (remains the same internally) ---
         def generate_next_token_and_compute_saliency(current_input_ids_inner):
-             # (Keep the internal logic of this helper function exactly as defined
-             # in the previous answer - it uses the loop variables like pixel_values,
-             # image_sizes, model, processor, layer_batch_size, cpu_offload_saliency,
-             # all_attn_layer_names correctly)
-            all_saliency_scores_batch = {}; next_token_id_inner = None; loss_val_inner = None
+            print(f"[Saliency] ===== Begin step with input shape: {current_input_ids_inner.shape} =====")
+
+            all_saliency_scores_batch = {}
+            next_token_id_inner = None
+            loss_val_inner = None
             model.eval()
-            # Use torch.ones_like(current_input_ids_inner) for attention_mask if not present
+
             current_mask = torch.ones_like(current_input_ids_inner)
             with torch.no_grad():
-                outputs_pred = model(input_ids=current_input_ids_inner,attention_mask=current_mask,pixel_values=pixel_values,image_sizes=image_sizes,use_cache=True)
-                logits = outputs_pred.logits[:, -1, :]; next_token_id_inner = torch.argmax(logits, dim=-1)
-                log_probs = torch.log_softmax(logits.float(), dim=-1); loss_val_inner = -log_probs[0, next_token_id_inner.item()].item()
-                del outputs_pred, logits, log_probs; gc.collect(); torch.cuda.empty_cache()
-            model.train(); grad_capture = GradientAttentionCapture(cpu_offload=cpu_offload_saliency)
+                outputs_pred = model(
+                    input_ids=current_input_ids_inner,
+                    attention_mask=current_mask,
+                    pixel_values=pixel_values,
+                    image_sizes=image_sizes,
+                    use_cache=True
+                )
+                logits = outputs_pred.logits[:, -1, :]
+                next_token_id_inner = torch.argmax(logits, dim=-1)
+                log_probs = torch.log_softmax(logits.float(), dim=-1)
+                loss_val_inner = -log_probs[0, next_token_id_inner.item()].item()
+
+                print(f"[Saliency] Forward prediction done. Token: {next_token_id_inner.item()}, Loss: {loss_val_inner:.4f}")
+                del outputs_pred, logits, log_probs
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            model.train()
+            print("[Saliency] Switched model to train mode.")
+            grad_capture = GradientAttentionCapture(cpu_offload=cpu_offload_saliency)
+            print("[Saliency] GradientAttentionCapture initialized.")
+
             num_layers = len(all_attn_layer_names)
             for batch_start in range(0, num_layers, layer_batch_size):
-                batch_end = min(batch_start + layer_batch_size, num_layers); current_layer_batch = all_attn_layer_names[batch_start:batch_end]
-                model.zero_grad(set_to_none=True); grad_capture.register_hooks(model, current_layer_batch)
-                loss_inner = None
+                batch_end = min(batch_start + layer_batch_size, num_layers)
+                current_layer_batch = all_attn_layer_names[batch_start:batch_end]
+                print(f"[Saliency] Registering hooks for layers {batch_start} to {batch_end - 1}...")
+
+                model.zero_grad(set_to_none=True)
+                grad_capture.register_hooks(model, current_layer_batch)
+
                 try:
                     with torch.enable_grad():
-                        outputs_grad = model(input_ids=current_input_ids_inner,attention_mask=current_mask,pixel_values=pixel_values,image_sizes=image_sizes,use_cache=False,output_attentions=True)
-                        logits_grad = outputs_grad.logits[:, -1, :]; log_probs_grad = torch.log_softmax(logits_grad.float(), dim=-1)
+                        outputs_grad = model(
+                            input_ids=current_input_ids_inner,
+                            attention_mask=current_mask,
+                            pixel_values=pixel_values,
+                            image_sizes=image_sizes,
+                            use_cache=False,
+                            output_attentions=True
+                        )
+                        logits_grad = outputs_grad.logits[:, -1, :]
+                        log_probs_grad = torch.log_softmax(logits_grad.float(), dim=-1)
                         loss_inner = -log_probs_grad[0, next_token_id_inner.item()]
-                    del outputs_grad, logits_grad, log_probs_grad; gc.collect(); torch.cuda.empty_cache()
+                        print(f"[Saliency] Computed loss: {loss_inner.item():.4f} for token ID {next_token_id_inner.item()}")
+
+                    del outputs_grad, logits_grad, log_probs_grad
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    print("[Saliency] Running backward pass...")
                     loss_inner.backward()
-                    batch_saliency = grad_capture.compute_saliency() # Use compute_saliency
+                    print("[Saliency] Backward pass completed.")
+
+                    print("[Saliency] Computing saliency scores...")
+                    batch_saliency = grad_capture.compute_saliency()
+                    print(f"[Saliency] Saliency computed for layers: {list(batch_saliency.keys())}")
                     all_saliency_scores_batch.update(batch_saliency)
-                except Exception as bk_err: grad_capture.clear_hooks(); raise bk_err
-                finally: grad_capture.clear_hooks(); # Clear hooks after batch
-                if 'loss_inner' in locals() and loss_inner is not None: del loss_inner
-                gc.collect(); torch.cuda.empty_cache()
+
+                except Exception as bk_err:
+                    grad_capture.clear_hooks()
+                    print(f"[Saliency] Exception during backward: {bk_err}")
+                    raise bk_err
+                finally:
+                    grad_capture.clear_hooks()
+
+                if 'loss_inner' in locals() and loss_inner is not None:
+                    del loss_inner
+                gc.collect()
+                torch.cuda.empty_cache()
+
             model.eval()
-            grad_capture.clear_cache() # Clear weights/grads captured during the step
+            grad_capture.clear_cache()
+            print("[Saliency] Cleared gradient cache.")
+            print(f"[Saliency] ===== End of step =====\n")
+
             return next_token_id_inner, all_saliency_scores_batch, loss_val_inner
 
         # --- 3. Token-by-Token Generation and Analysis Loop (remains the same) ---
