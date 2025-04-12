@@ -17,8 +17,7 @@ from analyzer.saliency_analyzer import (
 # --- Workflow Functions ---
 from analyzer.workflows import (
     run_logit_lens_workflow,
-    run_saliency_workflow,
-    run_saliency_workflow_memory_optimized # <-- ADD THE NEW FUNCTION HERE
+    run_saliency_workflow
 )
 
 # --- Public API Definition (`__all__`) ---
