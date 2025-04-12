@@ -32,5 +32,4 @@ __all__ = [
     # Workflows
     "run_logit_lens_workflow",
     "run_saliency_workflow",
-    "run_saliency_workflow_memory_optimized", # <-- ADD TO __all__
 ]
