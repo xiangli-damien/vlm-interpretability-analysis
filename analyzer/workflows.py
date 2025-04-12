@@ -439,10 +439,14 @@ def run_saliency_workflow(
                 new_token_text = processor.tokenizer.decode([next_token_id.item()])
                 print(f"  Generated token: '{new_token_text}' (ID: {next_token_id.item()}, Loss: {loss_val:.4f})")
                 target_idx = current_input_ids.shape[1] - 1
-                if not step_saliency_scores: flow_metrics = {"error": "No saliency scores computed"}
-                else: flow_metrics = analyze_layerwise_saliency_flow(step_saliency_scores, text_indices.cpu(), image_indices.cpu(), target_idx, cpu_offload=True)
+                if not step_saliency_scores: 
+                    print("  Warning: No saliency scores computed for this token.")
+                    flow_metrics = {"error": "No saliency scores computed"}
+                else:
+                    print(f"  [DEBUG Workflow] Saliency scores generated for step {step_idx+1}. Keys: {list(step_saliency_scores.keys())}") 
+                    flow_metrics = analyze_layerwise_saliency_flow(step_saliency_scores, text_indices.cpu(), image_indices.cpu(), target_idx, cpu_offload=True)
+                    print(f"  [DEBUG Workflow] Flow metrics computed for step {step_idx+1}. Keys: {list(flow_metrics.keys()) if isinstance(flow_metrics, dict) else 'Not a dict'}")
                 if save_plots and isinstance(flow_metrics, dict) and 'error' not in flow_metrics :
-                     # ... (plotting logic) ...
                      try:
                          model_name_short = model.config._name_or_path.split('/')[-1]; safe_token_text = "".join(c if c.isalnum() else "_" for c in new_token_text.strip()) or f"id{next_token_id.item()}"
                          plot_filename = f"token_{(step_idx+1):02d}_{safe_token_text}_saliency_flow.png"; plot_path = os.path.join(output_dir, plot_filename)
